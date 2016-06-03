@@ -11,6 +11,7 @@
 # limitations under the License.
 
 from ironic.drivers import base
+from ironic.drivers.modules import fake
 from ironic.drivers.modules import ipmitool
 from ironic.drivers.modules import pxe
 from ironic.drivers.modules import ssh
@@ -57,3 +58,11 @@ class AnsibleAndLibvirtDriver(base.BaseDriver):
         self.management = libvirt_power.IPMIManagement()
         self.vendor = ansible_deploy.AnsibleVendor()
 
+class FakeAnsibleDriver(base.BaseDriver):
+    """Ansible + Fake driver"""
+
+    def __init__(self):
+        self.power = fake.FakePower()
+        self.boot = pxe.PXEBoot()
+        self.deploy = ansible_deploy.AnsibleDeploy()
+        self.vendor = ansible_deploy.AnsibleVendor()
