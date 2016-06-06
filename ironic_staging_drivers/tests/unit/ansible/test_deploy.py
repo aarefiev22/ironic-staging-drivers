@@ -10,25 +10,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
-from ironic_lib import utils as irlib_utils
-from oslo_config import cfg
+import json
+import os
 
 from ironic.common import dhcp_factory
 from ironic.common import exception
 from ironic.common import image_service
-from ironic.common import images
 from ironic.common import states
-from ironic.drivers.modules import deploy_utils
-from ironic.drivers.modules import pxe
-from ironic.tests.unit.conductor import mgr_utils
+from ironic.common import utils as com_utils
 from ironic.conductor import task_manager
 from ironic.conductor import utils
+from ironic.drivers.modules import deploy_utils
+from ironic.drivers.modules import fake
+from ironic.drivers.modules import pxe
+from ironic.tests.unit.conductor import mgr_utils
 from ironic.tests.unit.db import base as db_base
-from ironic.tests.unit.db import utils as db_utils
 from ironic.tests.unit.objects import utils as object_utils
-from ironic_staging_drivers.ansible import deploy as ansible_deploy
+from ironic_lib import utils as irlib_utils
+import mock
+from oslo_config import cfg
 
+from ironic_staging_drivers.ansible import deploy as ansible_deploy
 
 CONF = cfg.CONF
 
@@ -51,6 +53,7 @@ DRIVER_INTERNAL_INFO = {
     'ansible_cleaning_ip': 'http://127.0.0.1/',
     'is_whole_disk_image': True,
 }
+
 
 class TestAnsibleMethods(db_base.DbTestCase):
     def setUp(self):
@@ -80,9 +83,6 @@ class TestAnsibleMethods(db_base.DbTestCase):
     def test_build_instance_info_for_deploy_glance_image(self, glance_mock):
         i_info = self.node.instance_info
         i_info['image_source'] = '733d1c44-a2ea-414b-aca7-69decf20d810'
-        driver_internal_info = self.node.driver_internal_info
-        driver_internal_info['is_whole_disk_image'] = True
-        self.node.driver_internal_info = driver_internal_info
         self.node.instance_info = i_info
         self.node.save()
 
@@ -168,8 +168,71 @@ class TestAnsibleMethods(db_base.DbTestCase):
             self.assertRaises(exception.InstanceDeployFailure,
                               ansible_deploy._get_node_ip, task)
 
+    @mock.patch.object(utils, 'node_power_action', autospec=True)
+    @mock.patch.object(fake.FakePower, 'get_power_state',
+                       return_value=states.POWER_OFF)
+    def test__reboot_and_finish_deploy(self, get_pow_state_mock,
+                                       power_action_mock):
+        self.config(group='ansible',
+                    post_deploy_get_power_state_retry_interval=0)
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            ansible_deploy._reboot_and_finish_deploy(task)
+            get_pow_state_mock.assert_called_once_with(task)
+            power_action_mock.assert_called_once_with(task, states.REBOOT)
+
+    @mock.patch.object(utils, 'node_power_action', autospec=True)
+    @mock.patch.object(fake.FakePower, 'get_power_state',
+                       return_value=states.POWER_ON)
+    def test__reboot_and_finish_deploy_retry(self, get_pow_state_mock,
+                                             power_action_mock):
+        self.config(group='ansible',
+                    post_deploy_get_power_state_retry_interval=0)
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            ansible_deploy._reboot_and_finish_deploy(task)
+            get_pow_state_mock.assert_called_with(task)
+            self.assertEqual(
+                CONF.ansible.post_deploy_get_power_state_retries + 1,
+                len(get_pow_state_mock.mock_calls))
+            power_action_mock.assert_called_once_with(task, states.REBOOT)
+
+    @mock.patch.object(com_utils, 'execute', return_value=('out', 'err'),
+                       autospec=True)
+    @mock.patch.object(os.path, 'join', return_value='/path/to/playbook',
+                       autospec=True)
+    def test__run_playbook(self, path_join_mock, execute_mock):
+        extra_vars = {"ironic_nodes": [{"name": self.node["uuid"],
+                      "ip": "127.0.0.1", "user": "test"}]}
+
+        ansible_deploy._run_playbook('deploy', extra_vars, '/path/to/key')
+
+        execute_mock.assert_called_once_with(
+            'env', 'ANSIBLE_CONFIG=%s' % CONF.ansible.config_file_path,
+            'ansible-playbook', '/path/to/playbook', '-i',
+            ansible_deploy.INVENTORY_FILE, '-e', json.dumps(extra_vars),
+            '--private-key=/path/to/key', '-vvvv')
+
+    @mock.patch.object(com_utils, 'execute', return_value=('out', 'err'),
+                       autospec=True)
+    @mock.patch.object(os.path, 'join', return_value='/path/to/playbook',
+                       autospec=True)
+    def test__run_playbook_tags(self, path_join_mock, execute_mock):
+        extra_vars = {"ironic_nodes": [{"name": self.node["uuid"],
+                      "ip": "127.0.0.1", "user": "test"}]}
+
+        ansible_deploy._run_playbook('deploy', extra_vars, '/path/to/key',
+                                     tags=['wait'])
+
+        execute_mock.assert_called_once_with(
+            'env', 'ANSIBLE_CONFIG=%s' % CONF.ansible.config_file_path,
+            'ansible-playbook', '/path/to/playbook', '-i',
+            ansible_deploy.INVENTORY_FILE, '-e', json.dumps(extra_vars),
+            '--tags=wait', '--private-key=/path/to/key', '-vvvv')
+
     @mock.patch.object(pxe.PXEBoot, 'clean_up_ramdisk')
-    @mock.patch.object(ansible_deploy, '_reboot_and_finish_deploy', autospec=True)
+    @mock.patch.object(ansible_deploy, '_reboot_and_finish_deploy',
+                       autospec=True)
     @mock.patch.object(utils, 'node_set_boot_device', autospec=True)
     @mock.patch.object(ansible_deploy, '_run_playbook', autospec=True)
     @mock.patch.object(ansible_deploy, '_prepare_extra_vars', autospec=True)
@@ -218,7 +281,8 @@ class TestAnsibleMethods(db_base.DbTestCase):
             clean_ramdisk_mock.assert_called_once_with(task)
 
     @mock.patch.object(pxe.PXEBoot, 'clean_up_ramdisk')
-    @mock.patch.object(ansible_deploy, '_reboot_and_finish_deploy', autospec=True)
+    @mock.patch.object(ansible_deploy, '_reboot_and_finish_deploy',
+                       autospec=True)
     @mock.patch.object(utils, 'node_set_boot_device', autospec=True)
     @mock.patch.object(ansible_deploy, '_run_playbook', autospec=True)
     @mock.patch.object(ansible_deploy, '_prepare_extra_vars', autospec=True)
@@ -228,10 +292,10 @@ class TestAnsibleMethods(db_base.DbTestCase):
     @mock.patch.object(ansible_deploy, '_parse_partitioning_info',
                        autospec=True)
     @mock.patch.object(ansible_deploy, '_prepare_variables', autospec=True)
-    def test__deploy(self, prepare_vars_mock, parse_part_info_mock,
-                     parse_dr_info_mock, prepare_extra_mock,
-                     run_playbook_mock, set_boot_device_mock,
-                     finish_deploy_mock, clean_ramdisk_mock):
+    def test__deploy_iwdi(self, prepare_vars_mock, parse_part_info_mock,
+                          parse_dr_info_mock, prepare_extra_mock,
+                          run_playbook_mock, set_boot_device_mock,
+                          finish_deploy_mock, clean_ramdisk_mock):
         ironic_nodes = {
             'ironic_nodes': [(self.node['uuid'],
                               DRIVER_INTERNAL_INFO['ansible_cleaning_ip'],
@@ -241,12 +305,15 @@ class TestAnsibleMethods(db_base.DbTestCase):
             'url': 'image_url',
             'checksum': 'aa'}
         prepare_vars_mock.return_value = vars
+        driver_internal_info = self.node.driver_internal_info
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
 
         with task_manager.acquire(self.context, self.node.uuid) as task:
             ansible_deploy._deploy(task, '127.0.0.1')
 
-            prepare_vars_mock.assert_called_once_with\
-                (task)
+            prepare_vars_mock.assert_called_once_with(task)
             self.assertFalse(parse_part_info_mock.called)
             parse_dr_info_mock.assert_called_once_with(task.node)
             prepare_extra_mock.assert_called_once_with(
@@ -320,8 +387,8 @@ class TestAnsibleDeploy(db_base.DbTestCase):
             power_mock.assert_called_once_with(task, states.REBOOT)
 
     @mock.patch.object(ansible_deploy, '_deploy', autospec=True)
-    @mock.patch.object(ansible_deploy, '_get_node_ip', return_value='127.0.0.1',
-                       autospec=True)
+    @mock.patch.object(ansible_deploy, '_get_node_ip',
+                       return_value='127.0.0.1', autospec=True)
     @mock.patch.object(utils, 'node_power_action', autospec=True)
     def test_deploy_done(self, power_mock, get_ip_mock, deploy_mock):
         self.config(group='ansible', use_ramdisk_callback=False)
@@ -375,7 +442,7 @@ class TestAnsibleDeploy(db_base.DbTestCase):
             get_cfdrive_path_mock.assert_called_once_with(self.node['uuid'])
             unlink_mock.assert_called_once_with('/path/test')
 
-    @mock.patch.object(ansible_deploy, '_get_clean_steps',  autospec=True)
+    @mock.patch.object(ansible_deploy, '_get_clean_steps', autospec=True)
     def test_get_clean_steps(self, get_clean_steps_mock):
         mock_steps = [{'priority': 10, 'interface': 'deploy',
                        'step': 'erase_devices'}]
@@ -388,7 +455,7 @@ class TestAnsibleDeploy(db_base.DbTestCase):
                                      CONF.deploy.erase_devices_priority})
         self.assertEqual(mock_steps, steps)
 
-    @mock.patch.object(ansible_deploy, '_get_clean_steps',  autospec=True)
+    @mock.patch.object(ansible_deploy, '_get_clean_steps', autospec=True)
     def test_get_clean_steps_priority(self, mock_get_clean_steps):
         self.config(erase_devices_priority=0, group='deploy')
         mock_steps = [{'priority': 10, 'interface': 'deploy',
@@ -403,9 +470,7 @@ class TestAnsibleDeploy(db_base.DbTestCase):
         self.assertEqual(mock_steps, steps)
 
     @mock.patch.object(ansible_deploy, '_run_playbook', autospec=True)
-    @mock.patch.object(ansible_deploy, '_parse_ansible_driver_info',
-                       return_value=('test_pl', 'test_u', 'test_k'),
-                       autospec=True)
+    @mock.patch.object(ansible_deploy, '_prepare_extra_vars', autospec=True)
     @mock.patch.object(ansible_deploy, '_parse_ansible_driver_info',
                        return_value=('test_pl', 'test_u', 'test_k'),
                        autospec=True)
@@ -452,8 +517,8 @@ class TestAnsibleDeploy(db_base.DbTestCase):
                 task.node, action='clean')
             self.assertFalse(run_playbook_mock.called)
 
-    @mock.patch.object(ansible_deploy, '_get_node_ip', return_value='127.0.0.1',
-                       autospec=True)
+    @mock.patch.object(ansible_deploy, '_get_node_ip',
+                       return_value='127.0.0.1', autospec=True)
     @mock.patch.object(utils, 'node_power_action', autospec=True)
     @mock.patch.object(ansible_deploy, '_build_ramdisk_options',
                        return_value={'op1': 'test1'}, autospec=True)
@@ -468,7 +533,8 @@ class TestAnsibleDeploy(db_base.DbTestCase):
 
             prepare_cleaning_ports_mock.assert_called_once_with(task)
             buid_options_mock.assert_called_once_with(task.node)
-            prepare_ramdisk_mock.assert_called_once_with(task, {'op1': 'test1'})
+            prepare_ramdisk_mock.assert_called_once_with(
+                task, {'op1': 'test1'})
             power_action_mock.assert_called_once_with(task, states.REBOOT)
             self.assertEqual(states.CLEANWAIT, state)
             self.assertFalse(get_ip_mock.called)
@@ -477,8 +543,8 @@ class TestAnsibleDeploy(db_base.DbTestCase):
     @mock.patch.object(ansible_deploy, '_parse_ansible_driver_info',
                        return_value=('test_pl', 'test_u', 'test_k'),
                        autospec=True)
-    @mock.patch.object(ansible_deploy, '_get_node_ip', return_value='127.0.0.1',
-                       autospec=True)
+    @mock.patch.object(ansible_deploy, '_get_node_ip',
+                       return_value='127.0.0.1', autospec=True)
     @mock.patch.object(ansible_deploy, '_run_playbook', autospec=True)
     @mock.patch.object(utils, 'node_power_action', autospec=True)
     @mock.patch.object(ansible_deploy, '_build_ramdisk_options',
@@ -512,6 +578,7 @@ class TestAnsibleDeploy(db_base.DbTestCase):
             run_playbook_mock.assert_called_once_with(
                 'test_pl', ironic_nodes, 'test_k', tags=['wait'])
             self.assertEqual(None, state)
+
 
 class TestAnsibleVendor(db_base.DbTestCase):
     def setUp(self):
@@ -552,15 +619,15 @@ class TestAnsibleVendor(db_base.DbTestCase):
 
             deploy_mock.assert_called_once_with(task, '127.0.0.1')
             log_mock.info.assert_called_once_with(mock.ANY, task.node['uuid'])
-            self.assertEquals([mock.call('resume'), mock.call('done')],
-                              task.process_event.mock_calls)
+            self.assertEqual([mock.call('resume'), mock.call('done')],
+                             task.process_event.mock_calls)
 
     @mock.patch.object(deploy_utils, 'set_failed_state', autospec=True)
     @mock.patch.object(ansible_deploy, 'LOG', autospec=True)
     @mock.patch.object(ansible_deploy, '_deploy',
                        side_effect=Exception('Boo'), autospec=True)
     def test_heartbeat_deploy_wait_fail(self, deploy_mock, log_mock,
-                                   set_fail_state_mock):
+                                        set_fail_state_mock):
         self.node['provision_state'] = states.DEPLOYWAIT
         self.node.save()
 
@@ -571,8 +638,8 @@ class TestAnsibleVendor(db_base.DbTestCase):
 
             deploy_mock.assert_called_once_with(task, '127.0.0.1')
             log_mock.exception.assert_called_once_with(mock.ANY)
-            self.assertEquals([mock.call('resume')],
-                              task.process_event.mock_calls)
+            self.assertEqual([mock.call('resume')],
+                             task.process_event.mock_calls)
             set_fail_state_mock.assert_called_once_with(task, mock.ANY)
 
     @mock.patch.object(ansible_deploy, '_notify_conductor_resume_clean',

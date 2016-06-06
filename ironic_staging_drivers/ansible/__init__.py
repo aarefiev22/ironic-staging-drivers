@@ -58,6 +58,7 @@ class AnsibleAndLibvirtDriver(base.BaseDriver):
         self.management = libvirt_power.IPMIManagement()
         self.vendor = ansible_deploy.AnsibleVendor()
 
+
 class FakeAnsibleDriver(base.BaseDriver):
     """Ansible + Fake driver"""
 
